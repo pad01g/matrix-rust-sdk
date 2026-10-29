@@ -38,6 +38,7 @@ use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
     error::IndexError,
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
+    tokenizer::{self, TOKENIZER_NAME},
     writer::SearchIndexWriter,
 };
 
@@ -172,6 +173,7 @@ impl fmt::Debug for RoomIndex {
 
 impl RoomIndex {
     pub(crate) fn new_with(index: Index, schema: RoomMessageSchema, room_id: &RoomId) -> RoomIndex {
+        index.tokenizers().register(TOKENIZER_NAME, tokenizer::text_analyzer());
         let query_parser = QueryParser::for_index(&index, schema.default_search_fields());
         Self {
             index,
@@ -261,7 +263,10 @@ impl RoomIndex {
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
     ) -> Result<SearchResult, IndexError> {
-        let query = self.query_parser.parse_query(query)?;
+        // The query grammar only separates terms with ASCII whitespace, and
+        // fails on e.g. the ideographic space that Japanese IMEs insert.
+        let query = query.replace(char::is_whitespace, " ");
+        let query = self.query_parser.parse_query(&query)?;
         let searcher = self.reader()?.searcher();
 
         let offset = pagination_offset.unwrap_or(0);
@@ -493,7 +498,7 @@ mod tests {
 
     use matrix_sdk_test::event_factory::EventFactory;
     use ruma::{
-        EventId, event_id,
+        EventId, OwnedEventId, event_id,
         events::{
             AnySyncMessageLikeEvent,
             room::message::{
@@ -503,6 +508,7 @@ mod tests {
         },
         room_id, user_id,
     };
+    use tantivy::schema::{DateOptions, DateTimePrecision, INDEXED, STORED, STRING, TEXT};
 
     use super::{
         IndexableEvent, MAX_MILLISECONDS, MilliSecondsSinceUnixEpoch, RoomIndex,
@@ -925,6 +931,190 @@ mod tests {
             "Search should find the edited document, got {result:?}"
         );
         assert_eq!(result.events[0].1, edit_id, "unexpected event id: {result:?}");
+
+        Ok(())
+    }
+
+    fn search_ids(index: &RoomIndex, query: &str) -> HashSet<OwnedEventId> {
+        index.search(query, 10, None).unwrap().events.into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn test_search_words_inside_sentences_without_spaces() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id).build();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        let messages = [
+            (event_id!("$ja:localhost"), "明日の会議は駅前のカフェで始めましょう"),
+            (event_id!("$zh:localhost"), "我们明天在火车站见面吧"),
+            (event_id!("$ko:localhost"), "내일 역에서 만나요"),
+            (event_id!("$th:localhost"), "พรุ่งนี้เจอกันที่สถานีรถไฟ"),
+        ];
+        for (event_id, body) in messages {
+            index_message(
+                &mut index,
+                f.text_msg(body).event_id(event_id).into_any_sync_message_like_event(),
+            )?;
+        }
+
+        for (query, event_id) in [
+            ("会議", "$ja:localhost"),
+            ("駅", "$ja:localhost"),
+            ("火车站", "$zh:localhost"),
+            ("역", "$ko:localhost"),
+            ("สถานี", "$th:localhost"),
+        ] {
+            assert_eq!(
+                search_ids(&index, query),
+                HashSet::from([EventId::parse(event_id)?]),
+                "unexpected results for {query}"
+            );
+        }
+
+        assert!(search_ids(&index, "議会").is_empty(), "bigrams must match in order");
+        assert!(search_ids(&index, "会議室").is_empty(), "every bigram must match");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_edit_and_remove_update_search_without_spaces() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id).build();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        let original_id = event_id!("$original:localhost");
+        index_message(
+            &mut index,
+            f.text_msg("保育園のお迎え").event_id(original_id).into_any_sync_message_like_event(),
+        )?;
+        assert_eq!(search_ids(&index, "保育園"), HashSet::from([original_id.to_owned()]));
+
+        let edit_id = event_id!("$edit:localhost");
+        let edit = f
+            .text_msg("幼稚園のお迎え")
+            .edit(original_id, RoomMessageEventContentWithoutRelation::text_plain("幼稚園のお迎え"))
+            .event_id(edit_id)
+            .into_original_sync_room_message_event();
+        index_edit(&mut index, original_id, edit)?;
+        assert!(search_ids(&index, "保育園").is_empty(), "the edited text must be gone");
+        assert_eq!(search_ids(&index, "幼稚園"), HashSet::from([edit_id.to_owned()]));
+
+        index_remove(&mut index, original_id)?;
+        assert!(search_ids(&index, "幼稚園").is_empty(), "the redacted text must be gone");
+        assert!(search_ids(&index, "お迎え").is_empty(), "the redacted text must be gone");
+
+        Ok(())
+    }
+
+    fn add(index: &mut RoomIndex, event_id: &EventId, body: &str) -> Result<(), IndexError> {
+        index.execute(RoomIndexOperation::Add(IndexableEvent::new(
+            event_id.to_owned(),
+            event_id.to_owned(),
+            user_id!("@user_id:localhost").to_owned(),
+            None,
+            body.to_owned(),
+        )))
+    }
+
+    #[test]
+    fn test_query_with_unicode_whitespace() -> Result<(), Box<dyn Error>> {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!room_id:localhost")).build();
+        let event_id = event_id!("$event_id:localhost");
+        add(&mut index, event_id, "東京と大阪")?;
+
+        // The ideographic space, as typed by Japanese IMEs.
+        assert_eq!(search_ids(&index, "東京\u{3000}大阪"), HashSet::from([event_id.to_owned()]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_with_an_older_schema_is_recreated() -> Result<(), Box<dyn Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let room_id = room_id!("!room_id:localhost");
+
+        // The schema before the bigram tokenizer, with `body` using `TEXT`.
+        let mut old_schema = tantivy::schema::Schema::builder();
+        old_schema.add_text_field("event_id", STORED | STRING);
+        old_schema.add_text_field("original_event_id", STRING);
+        let old_body = old_schema.add_text_field("body", TEXT);
+        old_schema.add_date_field(
+            "date",
+            DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Seconds),
+        );
+        old_schema.add_text_field("sender", STRING);
+        let old_dir = tmpdir.path().join(room_id.as_str());
+        std::fs::create_dir_all(&old_dir)?;
+        let old_index = tantivy::Index::create_in_dir(&old_dir, old_schema.build())?;
+        let mut writer = old_index.writer::<tantivy::TantivyDocument>(15_000_000)?;
+        writer.add_document(tantivy::doc!(old_body => "古いメッセージ"))?;
+        writer.commit()?;
+        drop(writer);
+
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .unencrypted()
+            .build()?;
+        assert!(search_ids(&index, "古いメッセージ").is_empty(), "old documents must be gone");
+
+        let event_id = event_id!("$event_id:localhost");
+        add(&mut index, event_id, "スイーツ食べたい")?;
+        assert_eq!(search_ids(&index, "スイーツ"), HashSet::from([event_id.to_owned()]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_with_the_current_schema_is_kept() -> Result<(), Box<dyn Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let room_id = room_id!("!room_id:localhost");
+        let event_id = event_id!("$event_id:localhost");
+
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .unencrypted()
+            .build()?;
+        add(&mut index, event_id, "スイーツ食べたい")?;
+        drop(index);
+
+        let index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .unencrypted()
+            .build()?;
+        assert_eq!(search_ids(&index, "スイーツ"), HashSet::from([event_id.to_owned()]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_recreations_dont_fail() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+
+        for _ in 0..20 {
+            let tmpdir = tempfile::tempdir()?;
+            let mut old_schema = tantivy::schema::Schema::builder();
+            old_schema.add_text_field("body", TEXT);
+            let old_dir = tmpdir.path().join(room_id.as_str());
+            std::fs::create_dir_all(&old_dir)?;
+            tantivy::Index::create_in_dir(&old_dir, old_schema.build())?;
+
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+                                .unencrypted()
+                                .build()
+                                .map(drop)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().unwrap().expect("building the index failed");
+                }
+            });
+        }
 
         Ok(())
     }

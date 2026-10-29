@@ -8,6 +8,7 @@ pub(crate) const TANTIVY_INDEX_MEMORY_BUDGET: usize = 50_000_000;
 
 mod encrypted;
 mod schema;
+mod tokenizer;
 mod writer;
 
 /// A module for errors relating to the search crate.

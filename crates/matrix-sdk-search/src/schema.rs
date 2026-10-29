@@ -14,12 +14,16 @@
 
 use tantivy::{
     DateTime, TantivyDocument,
-    schema::{DateOptions, DateTimePrecision, Field, INDEXED, STORED, STRING, Schema, TEXT},
+    schema::{
+        DateOptions, DateTimePrecision, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema,
+        TextFieldIndexing, TextOptions,
+    },
 };
 
 use crate::{
     error::{IndexError, IndexSchemaError},
     index::IndexableEvent,
+    tokenizer::TOKENIZER_NAME,
 };
 
 pub(crate) trait MatrixSearchIndexSchema {
@@ -51,7 +55,12 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
         let mut schema = Schema::builder();
         let event_id_field = schema.add_text_field("event_id", STORED | STRING);
         let original_event_id_field = schema.add_text_field("original_event_id", STRING);
-        let body_field = schema.add_text_field("body", TEXT);
+        let body_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let body_field = schema.add_text_field("body", body_options);
 
         let date_options =
             DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Seconds);

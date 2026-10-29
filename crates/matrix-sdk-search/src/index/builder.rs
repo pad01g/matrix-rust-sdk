@@ -1,12 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, PoisonError, RwLock},
 };
 
-use ruma::OwnedRoomId;
+use ruma::{OwnedRoomId, RoomId};
 use tantivy::{
-    Index,
+    Index, TantivyError,
     directory::{MmapDirectory, error::OpenDirectoryError},
 };
 use tracing::warn;
@@ -74,9 +74,20 @@ pub struct UnencryptedPhysicalRoomIndexBuilder {
 }
 
 impl UnencryptedPhysicalRoomIndexBuilder {
-    /// Build the [`RoomIndex`]
+    /// Build the [`RoomIndex`].
+    ///
+    /// An existing index with another schema, e.g. from an older version, is
+    /// deleted and recreated.
     pub fn build(&self) -> Result<RoomIndex, IndexError> {
-        let path = self.path.join(self.room_id.as_str());
+        open_or_recreate(
+            &self.path,
+            &self.room_id,
+            |err| matches!(err, IndexError::TantivyError(TantivyError::SchemaError(_))),
+            |path| self.open(path),
+        )
+    }
+
+    fn open(&self, path: &Path) -> Result<RoomIndex, IndexError> {
         let mmap_dir = match MmapDirectory::open(path) {
             Ok(dir) => Ok(dir),
             Err(err) => match err {
@@ -111,15 +122,9 @@ impl EncryptedPhysicalRoomIndexBuilder {
     /// An existing index that can't be opened, e.g. because it was encrypted
     /// with another key or in an older format, is deleted and recreated.
     pub fn build(&self) -> Result<RoomIndex, IndexError> {
-        let path = self.path.join(self.room_id.as_str());
-
         // Any failure to open recreates the index, as it can't tell a wrong
         // key from other errors.
-        self.open(&path).or_else(|err| {
-            warn!(room_id = %self.room_id, "Recreating the search index: {err}");
-            fs::remove_dir_all(&path)?;
-            self.open(&path)
-        })
+        open_or_recreate(&self.path, &self.room_id, |_| true, |path| self.open(path))
     }
 
     fn open(&self, path: &Path) -> Result<RoomIndex, IndexError> {
@@ -128,6 +133,43 @@ impl EncryptedPhysicalRoomIndexBuilder {
         let index = Index::open_or_create(mmap_dir, schema.as_tantivy_schema())?;
         Ok(RoomIndex::new_with(index, schema, &self.room_id))
     }
+}
+
+/// Taken for writing while an index is recreated, so that no other thread opens
+/// the files being deleted.
+static RECREATE_LOCK: RwLock<()> = RwLock::new(());
+
+/// Open the index of `room_id` in `base`, or delete and recreate it if opening
+/// fails with an error for which `should_recreate` is true.
+fn open_or_recreate(
+    base: &Path,
+    room_id: &RoomId,
+    should_recreate: impl Fn(&IndexError) -> bool,
+    open: impl Fn(&Path) -> Result<RoomIndex, IndexError>,
+) -> Result<RoomIndex, IndexError> {
+    let path = base.join(room_id.as_str());
+
+    let err = {
+        let _lock = RECREATE_LOCK.read().unwrap_or_else(PoisonError::into_inner);
+        match open(&path) {
+            Ok(index) => return Ok(index),
+            Err(err) => err,
+        }
+    };
+    if !should_recreate(&err) {
+        return Err(err);
+    }
+
+    let _lock = RECREATE_LOCK.write().unwrap_or_else(PoisonError::into_inner);
+
+    // Another thread may have recreated it while this one waited.
+    if let Ok(index) = open(&path) {
+        return Ok(index);
+    }
+
+    warn!(%room_id, "Recreating the search index: {err}");
+    fs::remove_dir_all(&path)?;
+    open(&path)
 }
 
 /// Builder for [`RoomIndex`] in memory

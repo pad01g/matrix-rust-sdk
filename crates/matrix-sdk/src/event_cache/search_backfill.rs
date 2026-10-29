@@ -187,7 +187,7 @@ impl EventCache {
 /// the event cache store have been indexed. Bump it when the index format
 /// changes, so the events get indexed again.
 #[cfg(feature = "experimental-search")]
-const REINDEX_MARKER: &str = "reindexed-v1";
+const REINDEX_MARKER: &str = "reindexed-v2";
 
 impl EventCache {
     /// Index the events saved in the event cache store, once: the search index

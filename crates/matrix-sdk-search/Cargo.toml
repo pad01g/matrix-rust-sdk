@@ -23,6 +23,7 @@ rand = { workspace = true, features = ["thread_rng"] }
 sha2 = { workspace =  true, features = ["alloc", "zeroize"] }
 tantivy = { version = "0.27.0", default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression", "columnar-zstd-compression"] }
 tracing = { workspace = true, features = ["attributes"] }
+unicode-normalization.workspace = true
 thiserror.workspace = true
 ruma = { workspace = true , features = [
     "client-api-c",
